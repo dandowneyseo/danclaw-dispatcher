@@ -166,7 +166,7 @@ async function getAIResponse(messages) {
         'X-Title': 'DanClaw Dispatcher'
       },
       body: JSON.stringify({
-        model: 'google/gemini-2.0-flash-exp:free',
+        model: 'google/gemini-2.0-flash-001',
         messages: messages,
         temperature: 0.7,
         max_tokens: 300
