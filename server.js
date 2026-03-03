@@ -11,6 +11,8 @@ const wss = new WebSocket.Server({ server, path: '/conversation' });
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '1SM7GgM6IMuvQlz2BwM3';
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 // System prompt for the AI dispatcher
@@ -35,9 +37,11 @@ IMPORTANT RULES:
 - NEVER say you are an AI. You are Dan, a dispatcher.
 - If asked something you can't answer, say "Let me have the driver call you back on that."
 - Keep it moving. Don't over-explain.
-- Once you have all the info, wrap it up: "Alright [name], I've got a driver heading your way. Sit tight."
+- Once you have all the info, wrap it up with a CLEAR GOODBYE. Say something like: "Alright [name], I've got a driver heading your way. You should see them in about 20 to 30 minutes. Thanks for calling DanClaw, you take care now. Goodbye!"
+- ALWAYS end your final dispatch message with a clear "Goodbye" or "Bye" so the caller knows the conversation is over.
+- After saying goodbye, do NOT continue the conversation. The call will end.
 
-When you have collected ALL required info (name, vehicle, location, service type), append this EXACT JSON block at the very end of your FINAL response (after your spoken message). The JSON must be on its own line starting with <<<JSON>>> and ending with <<<END>>>:
+When you have collected ALL required info (name, vehicle, location, service type), append this EXACT JSON block at the very end of your FINAL response (after your spoken goodbye message). The JSON must be on its own line starting with <<<JSON>>> and ending with <<<END>>>:
 
 <<<JSON>>>
 {"customer_name":"[name]","phone":"[caller phone]","vehicle":"[year make model]","location":"[location]","service_type":"[tow|jumpstart|lockout|tire_change|fuel_delivery|winch_out]"}
@@ -53,6 +57,29 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', uptime: process.uptime() });
 });
 
+// Helper function to end a Twilio call via REST API
+async function endTwilioCall(callSid) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !callSid) {
+    console.log('Cannot end call via API - missing credentials or callSid');
+    return;
+  }
+  try {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+    const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'Status=completed'
+    });
+    console.log(`Twilio call end response: ${response.status}`);
+  } catch (err) {
+    console.error('Error ending Twilio call:', err);
+  }
+}
+
 wss.on('connection', (ws, req) => {
   console.log('New WebSocket connection from Twilio');
   
@@ -62,7 +89,7 @@ wss.on('connection', (ws, req) => {
     callerPhone: null,
     messages: [{ role: 'system', content: SYSTEM_PROMPT }],
     collectedData: null,
-    greeting_sent: false
+    webhookSent: false
   };
 
   ws.on('message', async (data) => {
@@ -116,6 +143,21 @@ wss.on('connection', (ws, req) => {
             last: true
           };
           ws.send(JSON.stringify(response));
+          
+          // If we collected data, send to webhook and end the call
+          if (jsonMatch && state.collectedData) {
+            // Send data to Make.com webhook immediately
+            if (MAKE_WEBHOOK_URL && !state.webhookSent) {
+              state.webhookSent = true;
+              await sendToWebhook(state.collectedData);
+            }
+            
+            // Wait a few seconds for the goodbye message to be spoken, then end the call
+            setTimeout(async () => {
+              console.log('Ending call after goodbye message...');
+              await endTwilioCall(state.callSid);
+            }, 8000); // 8 second delay to let the goodbye message play
+          }
           break;
 
         case 'interrupt':
@@ -128,8 +170,9 @@ wss.on('connection', (ws, req) => {
 
         case 'end':
           console.log(`Call ended - SID: ${state.callSid}`);
-          // Send collected data to Make.com webhook
-          if (state.collectedData && MAKE_WEBHOOK_URL) {
+          // Send collected data to Make.com webhook if not already sent
+          if (state.collectedData && MAKE_WEBHOOK_URL && !state.webhookSent) {
+            state.webhookSent = true;
             await sendToWebhook(state.collectedData);
           }
           break;
@@ -145,7 +188,8 @@ wss.on('connection', (ws, req) => {
   ws.on('close', async () => {
     console.log(`WebSocket closed for call: ${state.callSid}`);
     // Also try to send data on close if not sent yet
-    if (state.collectedData && MAKE_WEBHOOK_URL) {
+    if (state.collectedData && MAKE_WEBHOOK_URL && !state.webhookSent) {
+      state.webhookSent = true;
       await sendToWebhook(state.collectedData);
     }
   });
